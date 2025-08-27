@@ -1,0 +1,15 @@
+# Tree-sitter AST parsing dependencies
+# Web reconnaissance conducted on 2025-01-27
+# Sources:
+# - https://pypi.org/project/tree-sitter/ (0.25.0, released 2024-07-20)
+# - https://pypi.org/project/tree-sitter-kotlin/ (1.1.0, released 2025-01-09)
+# - https://tree-sitter.github.io/py-tree-sitter/ (ABI version 15 support)
+
+tree-sitter==0.25.0
+tree-sitter-kotlin==1.1.0
+
+# Progress bars and UI
+tqdm>=4.65.0
+
+# Existing dependencies
+pathspec>=0.10.0

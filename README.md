@@ -1,20 +1,21 @@
 # nobifinder
 
-A single-file Python tool that finds usage of Kotlin/Java classes and their members across a codebase using intelligent heuristics.
+A powerful single-file Python tool that finds usage of Kotlin/Java classes and their members across codebases using Tree-sitter AST parsing (Kotlin) and intelligent regex heuristics (Java).
 
 [![Python 3.6+](https://img.shields.io/badge/python-3.6+-blue.svg)](https://www.python.org/downloads/)
 
 ## Table of Contents
 
 - [Overview](#overview)
-- [Features](#features)
+- [Features](#features)  
 - [Installation](#installation)
-- [Requirements](#requirements)
+- [Dependencies](#dependencies)
+- [Engine Modes](#engine-modes)
 - [Usage](#usage)
+- [Complete Flag Reference](#complete-flag-reference)
 - [Output Formats](#output-formats)
 - [Editor Integration](#editor-integration)
-- [.gitignore Handling](#gitignore-handling)
-- [Performance Tips](#performance-tips)
+- [Performance & Optimization](#performance--optimization)
 - [Troubleshooting](#troubleshooting)
 - [Self-test](#self-test)
 - [Security & Limitations](#security--limitations)
@@ -23,392 +24,689 @@ A single-file Python tool that finds usage of Kotlin/Java classes and their memb
 
 ## Overview
 
-nobifinder helps you find where a Kotlin/Java **class** or its **methods/fields** are used across your codebase. It works by analyzing source files using regex-based heuristics, respecting `.gitignore` patterns, and providing fast concurrent scanning with optional editor integration.
+nobifinder is a comprehensive code analysis tool that helps you find where Kotlin/Java **classes** and their **methods/fields** are used across your codebase. It offers two parsing engines for maximum accuracy and performance:
 
-The tool operates in three modes:
-- **Class mode**: Find all usages of a class (imports, constructors, type annotations, etc.)
-- **Method mode**: Find specific method calls, overrides, and references
+- **AST Engine**: Tree-sitter based parsing for precise Kotlin analysis
+- **Regex Engine**: Intelligent heuristics for Java and fallback scenarios
+
+The tool operates in three search modes:
+- **Class mode**: Find all class usages (imports, constructors, type annotations, etc.)
+- **Method mode**: Find method calls, overrides, and references  
 - **Field mode**: Find field/property access, assignments, and references
 
-**Key capabilities**: Comment/string stripping for clean matching, `.gitignore` support via `pathspec`, concurrent file processing, JSON output, and direct editor integration with VS Code, IntelliJ IDEA, and Android Studio.
-
-**Limitations**: Uses heuristic parsing (not full AST), may produce false positives with very common names, and cannot detect reflection/dynamic loading/code generation.
+**Key capabilities**: Dual parsing engines, Android Studio integration with clickable links, real-time progress tracking, `.gitignore` support, concurrent processing, JSON output, and direct editor integration.
 
 ## Features
 
+### Core Analysis
+- **Dual parsing engines**: Tree-sitter AST for Kotlin precision + regex heuristics for Java compatibility
 - **Multi-mode search**: Class usages, method calls, or field/property access
 - **Flexible member selection**: Comma-separated names, regex patterns (`/^get.*/`), or `all`
 - **Smart filtering**: `--strict-import` (requires explicit imports), `--same-package-ok` (allows same-package usage)
+- **Comment/string stripping**: Excludes false positives from comments and string literals
+
+### Developer Experience
+- **Android Studio integration**: Clickable `at file:line` links with optional clipboard copy (macOS)
+- **Interactive CLI**: Guided prompts for target selection and search mode
+- **Progress tracking**: Real-time progress bars and scanning statistics
+- **Editor integration**: Direct file opening in VS Code, IntelliJ IDEA, and Android Studio
+- **Multiple output formats**: Android Studio format (default), colored tables, or structured JSON
+
+### Performance & Compatibility
 - **Gitignore support**: Respects `.gitignore` files via `pathspec` library
 - **Always-ignored directories**: `.git`, `build`, `out`, `dist`, `target`, `.gradle`, `.idea`, `node_modules`
-- **Multiple output formats**: Human-readable tables with colors, or structured JSON
-- **Line-level details**: `--with-lines` shows exact line numbers and code snippets
-- **Editor integration**: `--open`/`--select` opens files directly in VS Code, IDEA, or Android Studio
-- **Performance optimizations**: Concurrent scanning, customizable worker threads, file extension filtering
-- **Built-in validation**: `--self-test` runs comprehensive test suite
+- **Concurrent scanning**: Customizable worker threads for optimal performance
+- **Cross-platform**: Windows, macOS, and Linux support
+- **File filtering**: Extension-based filtering and symlink handling
 
 ## Installation
 
-To make `nobifinder` globally available (so you can type `nobifinder` in any terminal and it runs in that directory), choose one of these methods:
+### Method 1: Global Command (Recommended)
 
-### macOS/Linux (Recommended)
-
-Create a symlink on your PATH:
-
+**macOS/Linux:**
 ```bash
-# Make the script executable
-chmod +x /absolute/path/to/nobifinder.py
+# Make executable and create symlink
+chmod +x nobifinder.py
+sudo ln -sf "$(pwd)/nobifinder.py" /usr/local/bin/nobifinder
 
-# Create symlink (choose one location)
-sudo ln -s /absolute/path/to/nobifinder.py /usr/local/bin/nobifinder
-# OR for user-only access:
-mkdir -p ~/bin
-ln -s /absolute/path/to/nobifinder.py ~/bin/nobifinder
-
-# Ensure the target directory is on PATH
-echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc
-exec zsh
+# Verify installation
+nobifinder --help
 ```
 
-### macOS/Linux (Shell Function)
+**Windows (PowerShell as Administrator):**
+```powershell
+# Create wrapper script
+$binPath = "$env:USERPROFILE\bin"
+New-Item -ItemType Directory -Force -Path $binPath
+$scriptPath = "$(Get-Location)\nobifinder.py"
+@"
+@echo off
+python "$scriptPath" %*
+"@ | Out-File -FilePath "$binPath\nobifinder.cmd" -Encoding ASCII
 
-Add to your `~/.zshrc` or `~/.bashrc`:
+# Add to PATH (if not already present)
+$currentPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+if ($currentPath -notlike "*$binPath*") {
+    [Environment]::SetEnvironmentVariable("PATH", "$currentPath;$binPath", "User")
+}
+```
 
+### Method 2: Shell Function
+
+**Bash/Zsh** - Add to `~/.bashrc` or `~/.zshrc`:
 ```bash
 nobifinder() { python /absolute/path/to/nobifinder.py "$@"; }
-
-# Reload shell
-exec $SHELL
 ```
 
-### Windows
-
-**PowerShell** - Add to your PowerShell profile (`$PROFILE`):
-
+**PowerShell** - Add to PowerShell profile (`$PROFILE`):
 ```powershell
 function nobifinder { python "C:\absolute\path\to\nobifinder.py" @args }
-
-# Save the profile, then reload:
-. $PROFILE
 ```
 
-**Command Prompt** - Create `nobifinder.cmd` in a directory on PATH (e.g., `%USERPROFILE%\bin\`):
+## Dependencies
 
-```bat
-@echo off
-python "C:\absolute\path\to\nobifinder.py" %*
-```
-
-Then add `%USERPROFILE%\bin` to your system PATH environment variable.
-
-## Requirements
-
+### Core Requirements
 - **Python 3.6+**
-- **Optional**: `pathspec` library for `.gitignore` support
-  ```bash
-  pip install pathspec
-  ```
-  
-Without `pathspec`, the tool will still work but skip `.gitignore` file processing and only use the always-ignored directory list.
+
+### Optional Dependencies (Recommended)
+Install for full functionality:
+
+```bash
+pip install tree-sitter==0.25.0 tree-sitter-kotlin==1.1.0 tqdm>=4.65.0 pathspec>=0.10.0
+```
+
+**Individual components:**
+- `tree-sitter` + `tree-sitter-kotlin`: AST parsing engine for Kotlin files
+- `tqdm`: Progress bars during scanning  
+- `pathspec`: `.gitignore` file processing
+
+**Fallback behavior:**
+- **Without Tree-sitter**: Uses regex engine for all files (reduced accuracy for Kotlin)
+- **Without tqdm**: No progress bars (functionality unchanged)
+- **Without pathspec**: Only hardcoded directories ignored (no `.gitignore` support)
+
+## Engine Modes
+
+nobifinder automatically selects the optimal parsing engine based on file type and availability:
+
+### AST Engine (Default for Kotlin)
+**Uses:** Tree-sitter with Kotlin grammar for precise parsing
+
+**Capabilities:**
+- Exact class/interface/enum/object declarations
+- Function declarations with modifiers (suspend, override, etc.)
+- Property declarations (val/var) with type information  
+- Constructor calls and object creation
+- Annotations with type extraction
+- Type references and generic arguments
+- Import handling with alias support
+
+**Limitations:**
+- Kotlin syntax support up to ~2.1 (limited 2.2+ features)
+- Context parameters and newest constructs may not parse correctly
+
+### Regex Engine (Default for Java)
+**Uses:** Intelligent regex patterns with heuristic matching
+
+**Capabilities:**
+- Class/interface/enum declarations
+- Method and field patterns
+- Import statement analysis
+- Variable type tracking for member usage
+- Comment and string literal filtering
+
+**Limitations:**
+- Heuristic-based matching may have false positives
+- Complex generic syntax may be imprecise
+- Nested class handling limitations
+
+### Engine Selection
+- **Automatic**: AST for `.kt`/`.kts` files (if available), regex for `.java` and fallback
+- **Manual**: Use `--engine ast` or `--engine regex` to force specific engine
+- **Fallback**: AST automatically falls back to regex on parsing errors
 
 ## Usage
 
-### Interactive Mode
-
-Simply run the tool and follow the prompts:
+### Quick Start
 
 ```bash
+# Interactive mode (recommended for first use)
 nobifinder
+
+# Find all class usages
+nobifinder --mode class
+
+# Find specific methods
+nobifinder --mode method --member "doSomething,helper"  
+
+# Find fields matching regex pattern
+nobifinder --mode field --member "/^id.*/"
 ```
 
-The tool will:
-1. Ask for the target class file path
-2. Parse the class to find available methods/fields
-3. Let you choose search mode (class/method/field)
-4. For method/field modes, let you select specific members
-
-### Command Line Examples
+### Advanced Examples
 
 ```bash
-# Find all class usages interactively
-nobifinder
+# Force AST engine with progress and stats
+nobifinder --engine ast --mode method --member "all" --progress --stats
 
-# Find specific method usages
-nobifinder --mode method --member "doSomething,helper"
+# JSON output with enhanced line details  
+nobifinder --mode field --member "name,email" --json --with-lines
 
-# Find fields matching regex with JSON output
-nobifinder --mode field --member "/^id.*/" --json --with-lines
-
-# Search in specific directory and open results in editor
+# Search specific directory and open in editor
 nobifinder --root /path/to/project --open
 
-# Interactive file selection for editor
+# Interactive file selection with strict import checking
 nobifinder --select --strict-import --same-package-ok
 
-# Limit results and disable colors
-nobifinder --limit 10 --no-color
+# High-performance scanning with custom settings
+nobifinder --max-workers 16 --ext ".kt,.kts" --no-android-format
 
-# Use custom file extensions and increase worker threads
-nobifinder --ext ".kt,.java,.scala" --max-workers 16
-
-# Verbose mode with symlink following
-nobifinder --verbose --follow-symlinks
+# Copy Android Studio links to clipboard (macOS)
+nobifinder --copy-links --android-format
 ```
 
-### Flags
+### Interactive Workflow
+
+1. **Target Selection**: Enter absolute path to Kotlin/Java class file
+2. **Mode Selection**: Choose from:
+   - `[1]` Class usages (current behavior)  
+   - `[2]` Method usages
+   - `[3]` Field/Property usages
+3. **Member Selection** (for modes 2/3):
+   - Comma-separated: `doSomething,helper,onClick`
+   - Regex pattern: `/^on[A-Z].*/`  
+   - All members: `all`
+4. **Results**: View in Android Studio format or table, optionally open in editor
+
+## Complete Flag Reference
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--root` | `.` | Search root directory |
 | `--mode` | *interactive* | Search mode: `class`, `method`, or `field` |
-| `--member` | *none* | Member names (comma-separated, `/regex/`, or `all`) for method/field modes |
+| `--member` | *none* | Member names for method/field modes (required with --mode) |
+| `--engine` | *auto-detect* | Parsing engine: `ast` or `regex` |
 | `--json` | `false` | Output JSON format instead of human-readable |
-| `--with-lines` | `false` | Include line numbers and code snippets in output |
+| `--with-lines` | `true` | Include line numbers and code snippets |
+| `--no-lines` | `false` | Disable line numbers and snippets |
 | `--strict-import` | `false` | Only report files with explicit imports or FQN usage |
-| `--same-package-ok` | `false` | Allow simple name matches if in same package as target |
+| `--same-package-ok` | `false` | Allow simple name matches in same package |
 | `--ext` | `.kt,.kts,.java` | Comma-separated file extensions to scan |
-| `--max-workers` | `min(32, cpu_count + 4)` | Maximum number of worker threads |
-| `--follow-symlinks` | `false` | Follow symbolic links during directory traversal |
+| `--max-workers` | `min(32, cpu+4)` | Maximum worker threads |
+| `--follow-symlinks` | `false` | Follow symbolic links during traversal |
 | `--no-color` | `false` | Disable ANSI color output |
 | `--verbose` | `false` | Enable verbose logging to stderr |
 | `--open` | `false` | Open all matching files in editor |
-| `--select` | `false` | Interactively select which files to open in editor |
-| `--limit` | *unlimited* | Limit number of results shown in human output |
-| `--self-test` | `false` | Run built-in self-test and exit |
+| `--select` | `true` | Interactive file selection for editor (default) |
+| `--no-select` | `false` | Disable interactive selection |
+| `--limit` | *unlimited* | Limit results shown in human output |
+| `--progress` | `false` | Show progress bar during scanning |
+| `--stats` | `false` | Show scanning statistics at end |
+| `--android-format` | `true` | Output Android Studio clickable format (default) |
+| `--no-android-format` | `false` | Use table format instead |
+| `--copy-links` | `false` | Copy clickable links to clipboard (macOS only) |
+| `--self-test` | `false` | Run built-in test suite and exit |
+
+### Flag Combinations
+
+```bash
+# Non-interactive with all options
+nobifinder --mode method --member "all" --engine ast --json --no-select
+
+# Performance optimized
+nobifinder --max-workers 32 --ext ".kt" --no-android-format --progress
+
+# Minimal output
+nobifinder --no-lines --no-color --limit 5 --no-select
+```
 
 ## Output Formats
 
-### Human-readable Format
+### Android Studio Format (Default)
 
-Default table output with optional colors and line details:
+Clickable links that work directly in Android Studio console:
 
 ```
-Path                                    Matches Lines  Member(s)
-----------------------------------------------------------------
-src/main/kotlin/UserService.kt          3       12,15  doSomething,helper
-src/test/kotlin/UserServiceTest.kt      1       45     doSomething
+📱 Android Studio Clickable Links:
+==================================================
+at /path/to/src/UserService.kt:12
+   → method doSomething  user.doSomething()
+
+at /path/to/src/UserService.kt:15  
+   → field name: user.name = "updated"
+
+at /path/to/test/UserServiceTest.kt:45
+   → method doSomething  override fun doSomething()
 ```
 
-With `--with-lines`:
+**With clipboard copy (macOS):**
+```bash
+nobifinder --copy-links
+# Output: 📋 3 links copied to clipboard!
 ```
-src/main/kotlin/UserService.kt          3       12,15  doSomething,helper
+
+### Table Format
+
+Classic table output with `--no-android-format`:
+
+```
+Path                                  Matches Lines    Member(s)
+--------------------------------------------------------------------
+src/main/kotlin/UserService.kt         3      12,15,20 doSomething,name
+src/test/kotlin/UserServiceTest.kt     1      45       doSomething
+```
+
+**With line details (`--with-lines`):**
+```
+src/main/kotlin/UserService.kt         3      12,15,20 doSomething,name
   12: method doSomething  user.doSomething()
-  15: method helper       helper(42)
+  15: field name         user.name = "updated"  
+  20: method doSomething  override fun doSomething()
 ```
 
 ### JSON Format
 
-Structured output with `--json`:
+Structured output with v2 schema supporting AST engine:
 
-**Class mode example:**
 ```json
 {
   "target": {
     "package": "com.example",
-    "class_name": "User",
+    "class_name": "User", 
     "fqn": "com.example.User"
   },
-  "mode": "class",
-  "members": [],
+  "engine": "ast",
+  "mode": "method",
+  "members": ["doSomething", "getName"],
   "results": [
     {
       "path": "src/main/kotlin/UserService.kt",
       "count": 2,
       "package": "com.example.service",
       "line_hits": [
-        {"line": 10, "snippet": "import com.example.User"},
-        {"line": 25, "snippet": "val user = User(name)"}
+        {
+          "line": 12,
+          "col": 8,
+          "member": "doSomething", 
+          "kind": "method",
+          "snippet": "user.doSomething()"
+        },
+        {
+          "line": 25,
+          "col": 12,
+          "member": "getName",
+          "kind": "method", 
+          "snippet": "user.getName()"
+        }
       ]
     }
   ]
 }
 ```
 
-**Method/Field mode example:**
-```json
-{
-  "target": {
-    "package": "com.example", 
-    "class_name": "User",
-    "fqn": "com.example.User"
-  },
-  "mode": "method",
-  "members": ["getName", "setEmail"],
-  "results": [
-    {
-      "path": "src/main/kotlin/UserService.kt",
-      "count": 2,
-      "package": "com.example.service", 
-      "line_hits": [
-        {"line": 15, "member": "getName", "kind": "method", "snippet": "user.getName()"},
-        {"line": 20, "member": "setEmail", "kind": "method", "snippet": "user.setEmail(email)"}
-      ]
-    }
-  ]
-}
-```
-
-Exit codes: `0` (success with results), `1` (no results found), `2` (error).
+**Exit codes:** `0` (results found), `1` (no results), `2` (error)
 
 ## Editor Integration
-
-The `--open` and `--select` flags automatically open matching files in your preferred editor.
 
 ### Supported Editors
 
 **Auto-detection priority:**
-1. `VISUAL` or `EDITOR` environment variables
-2. VS Code (`code` command) - opens with `-g file:line`
-3. IntelliJ IDEA (`idea` command) - opens with `--line N file`
-4. Android Studio (`studio` command) - opens with `--line N file`
+1. `$VISUAL` or `$EDITOR` environment variables
+2. VS Code (`code` command available)
+3. IntelliJ IDEA (`idea` command available)  
+4. Android Studio (`studio` command available)
 5. Platform fallbacks: `open` (macOS), `xdg-open` (Linux), `start` (Windows)
 
-**Editor commands:**
+### Commands Used
+
 - **VS Code**: `code -g /path/file.kt:25`
-- **IntelliJ IDEA**: `idea --line 25 /path/file.kt`
+- **IntelliJ IDEA**: `idea --line 25 /path/file.kt`  
 - **Android Studio**: `studio --line 25 /path/file.kt`
+- **macOS fallback**: `open -a "Android Studio" --args --line 25 /path/file.kt`
 
-**Usage:**
-- `--open`: Opens all matching files automatically
-- `--select`: Shows interactive list to choose which files to open
+### Usage Modes
 
-The tool gracefully handles missing editors and continues execution if opening fails.
-
-## .gitignore Handling
-
-nobifinder respects gitignore patterns using the `pathspec` library:
-
-- **Always ignored**: `.git`, `build`, `out`, `dist`, `target`, `.gradle`, `.idea`, `node_modules`
-- **Gitignore files**: Loads patterns from all `.gitignore` files found in the directory tree
-- **Pattern matching**: Uses `gitwildmatch` syntax (same as Git)
-- **Fallback**: Without `pathspec`, only always-ignored directories are skipped
-
-Install `pathspec` for full gitignore support:
+**`--open` (Open all files):**
 ```bash
-pip install pathspec
+nobifinder --mode method --member "doSomething" --open
+# Opens all matching files automatically in editor
 ```
 
-## Performance Tips
+**`--select` (Interactive selection - default):**
+```bash
+nobifinder --mode method --member "doSomething" 
+# Shows interactive list:
+# [1] /path/UserService.kt:12  method doSomething
+# [2] /path/UserTest.kt:45     method doSomething  
+# Enter numbers (e.g., 1,2,5) or 'all' or 'none':
+```
 
-- **Limit search scope**: Use `--root` to search only relevant directories
-- **Filter extensions**: Use `--ext` to scan only necessary file types (e.g., `--ext ".kt,.java"`)
-- **Adjust concurrency**: Use `--max-workers` to match your system (default is usually optimal)
-- **Streaming processing**: Files are read and processed individually to minimize memory usage
-- **Early filtering**: Gitignore patterns and extensions filter files before content scanning
+**Environment Setup:**
+```bash
+# Override auto-detection
+export EDITOR=code
+export VISUAL=idea
+
+# Ensure commands are available
+which code idea studio
+```
+
+## Performance & Optimization
+
+### Engine Performance
+
+**AST Engine (Kotlin):**
+- ✅ Higher accuracy, fewer false positives
+- ✅ Precise member usage detection  
+- ⚠️ Slightly slower than regex
+- ⚠️ Limited to supported Kotlin syntax
+
+**Regex Engine (Java/Fallback):**
+- ✅ Fast processing speed
+- ✅ Broader language compatibility
+- ⚠️ Potential false positives
+- ⚠️ Less precise member tracking
+
+### Optimization Tips
+
+**Scope Reduction:**
+```bash
+# Search only specific directory
+nobifinder --root src/main/kotlin
+
+# Target specific file types  
+nobifinder --ext ".kt,.kts"
+
+# Limit results for large codebases
+nobifinder --limit 50
+```
+
+**Performance Tuning:**
+```bash
+# Increase workers for CPU-bound tasks
+nobifinder --max-workers 16
+
+# Monitor with progress and stats
+nobifinder --progress --stats --verbose
+
+# Disable heavy features for speed
+nobifinder --no-android-format --no-lines
+```
+
+**Memory Efficiency:**
+- Files processed individually (streaming)
+- Only matching files kept in memory
+- Early filtering via extensions and gitignore
+
+### Benchmark Expectations
+
+Typical performance on modern hardware:
+- **Small project** (< 1K files): 1-3 seconds
+- **Medium project** (1K-10K files): 5-15 seconds  
+- **Large project** (10K+ files): 30-60 seconds
+
+AST engine adds ~10-20% overhead vs regex for Kotlin files.
 
 ## Troubleshooting
 
-### PATH Issues
+### Installation Issues
 
-**macOS/Linux - Command not found:**
+**Command not found (macOS/Linux):**
 ```bash
-# Check if symlink exists
+# Check symlink
 ls -la /usr/local/bin/nobifinder
 
-# Verify PATH includes the directory
-echo $PATH
+# Verify PATH
+echo $PATH | grep -o '/usr/local/bin'
 
-# Add to PATH if missing
+# Fix PATH
 echo 'export PATH="/usr/local/bin:$PATH"' >> ~/.zshrc
 exec zsh
 ```
 
-**Windows - Command not recognized:**
+**Command not recognized (Windows):**
 ```cmd
-# Check PATH environment variable
+# Check PATH
 echo %PATH%
 
-# Add directory to PATH via System Properties > Environment Variables
-# Or use PowerShell:
-$env:PATH += ";C:\path\to\nobifinder\directory"
+# Verify script location
+dir "%USERPROFILE%\bin\nobifinder.cmd"
+```
+
+### Engine Issues
+
+**AST engine not available:**
+```bash
+# Install Tree-sitter dependencies
+pip install tree-sitter==0.25.0 tree-sitter-kotlin==1.1.0
+
+# Test installation
+python -c "import tree_sitter; import tree_sitter_kotlin; print('OK')"
+
+# Force engine selection
+nobifinder --engine regex  # Use regex if AST fails
+```
+
+**Parse errors with AST:**
+```bash
+# Use verbose mode to see errors
+nobifinder --engine ast --verbose
+
+# Check Kotlin version compatibility
+# AST supports Kotlin up to ~2.1
+
+# Force regex fallback for problematic files
+nobifinder --engine regex
+```
+
+### Search Issues
+
+**No results found:**
+```bash
+# Try relaxed filtering
+nobifinder --same-package-ok  # Allow same-package usage
+
+# Remove strict requirements  
+nobifinder --no-strict-import  # Include simple name matches
+
+# Check target class
+nobifinder --verbose  # See parsing details
+
+# Verify file extensions
+nobifinder --ext ".kt,.kts,.java" --verbose
+```
+
+**Too many false positives:**
+```bash
+# Use strict filtering
+nobifinder --strict-import  # Require explicit imports
+
+# Try AST engine for better precision
+nobifinder --engine ast
+
+# Exclude same-package matches
+# (don't use --same-package-ok)
 ```
 
 ### Editor Integration Issues
 
 **Editor not opening:**
-- Set `VISUAL` or `EDITOR` environment variables: `export EDITOR=code`
-- Ensure editor commands are on PATH: `which code`, `which idea`, `which studio`
-- Check if editor supports command line: `code --help`, `idea --help`
-- Use absolute paths if commands aren't found
-
-**Wrong editor opens:**
-- Override detection with environment variables
-- Check priority: `VISUAL` > `EDITOR` > auto-detection
-
-### Gitignore Not Working
-
-**Files not being ignored:**
 ```bash
-# Install pathspec
-pip install pathspec
+# Check editor availability
+which code idea studio
 
-# Verify .gitignore exists and is readable
-cat .gitignore
+# Set explicit editor
+export EDITOR=code
+nobifinder --open
 
-# Use --verbose to see what files are processed
-nobifinder --verbose
+# Test editor command manually
+code -g /path/to/file.kt:1
 ```
 
-### No Results Found
+**Wrong editor opens:**
+```bash
+# Override auto-detection
+export VISUAL=idea  # Takes priority over EDITOR
+export EDITOR=code
 
-**When expecting matches:**
-- Try `--same-package-ok` to allow same-package usage without imports
-- Remove `--strict-import` to include simple name matches
-- Check if target class name is too generic (e.g., "User", "Item")
-- Use `--verbose` to see search details
-- Verify target file path and class name are correct
+# Check detection order
+nobifinder --verbose --open
+```
+
+### Performance Issues
+
+**Slow scanning:**
+```bash
+# Monitor bottlenecks
+nobifinder --progress --stats --verbose
+
+# Reduce scope
+nobifinder --root src/main --ext ".kt"
+
+# Increase workers
+nobifinder --max-workers 32
+
+# Check gitignore efficiency
+nobifinder --verbose  # See ignored files
+```
+
+**Memory usage:**
+```bash
+# Disable line storage for large results
+nobifinder --no-lines
+
+# Limit output
+nobifinder --limit 100
+
+# Use JSON for programmatic processing
+nobifinder --json > results.json
+```
 
 ### Display Issues
 
-**Garbled colors in terminal:**
+**Garbled output:**
 ```bash
 # Disable colors
 nobifinder --no-color
 
-# Or set terminal environment
+# Use table format
+nobifinder --no-android-format
+
+# Check terminal support
+echo $TERM
 export TERM=xterm-256color
 ```
 
+**Android Studio links not clickable:**
+- Ensure you're running in Android Studio terminal/console
+- Links work in "Run" and "Build" console tabs
+- Copy to clipboard with `--copy-links` as alternative
+
 ## Self-test
 
-Validate the tool installation and functionality:
+Validate installation and functionality:
 
 ```bash
 nobifinder --self-test
 ```
 
-The self-test creates a temporary directory structure with test files and validates:
-- Target file parsing (package, class, members extraction)
-- Class usage detection across multiple files
-- Method and field usage scanning
-- Gitignore pattern filtering
-- Comment/string stripping functionality
+The comprehensive test suite validates:
 
-Returns exit code `0` on success, `2` on failure.
+### Test Coverage
+- **Target parsing**: Package extraction, class/method/field detection
+- **Engine testing**: Both AST and regex engines (if available)
+- **Search modes**: Class, method, and field usage detection
+- **Filtering**: Gitignore patterns, import requirements, package matching
+- **Edge cases**: False positive handling, comment/string exclusion
+- **File handling**: Extension filtering, symlink processing
+
+### Test Structure
+Creates temporary test project with:
+- **Target class**: Kotlin data class with methods, fields, annotations
+- **Usage files**: Method calls, property access, type references, annotations
+- **False positives**: Comments, strings, unrelated classes  
+- **Ignored files**: Files in `build/` directory (gitignore test)
+
+### Expected Output
+```
+Running self-test...
+Testing regex engine...
+PASS: regex engine class mode tests completed
+Testing ast engine...
+PASS: ast engine class mode tests completed
+PASS: All self-tests completed successfully
+```
+
+**Exit codes**: `0` (success), `2` (failure)
+
+**Troubleshooting test failures:**
+```bash
+# Run with verbose output
+nobifinder --self-test --verbose
+
+# Test individual engines
+nobifinder --engine regex --self-test
+nobifinder --engine ast --self-test
+```
 
 ## Security & Limitations
 
-### Limitations
-
-- **Heuristic parsing**: Uses regex patterns, not full AST analysis
-- **False positives**: Very common class names may match unrelated code
-- **No reflection detection**: Cannot find dynamic/reflection-based usage
-- **No code generation**: Generated code usages may be missed
-- **Multi-module projects**: Discovers source sets by directory walking only
-
 ### Security Considerations
 
-- Reads all source files in the search directory
-- Respects gitignore to avoid scanning sensitive directories
+**File Access:**
+- Reads all source files in search directory
+- Respects `.gitignore` to avoid sensitive directories  
 - No external network access or code execution
-- Temporary files created only during self-test (cleaned up automatically)
+- Temporary files only during self-test (auto-cleanup)
+
+**Privacy:**
+- No data collection or telemetry
+- All processing performed locally
+- Editor integration uses standard command-line interfaces
+
+### Current Limitations
+
+**Parsing Accuracy:**
+- **AST engine**: Limited to supported Kotlin syntax (~2.1)
+- **Regex engine**: Heuristic matching may have false positives
+- **Both**: Cannot detect reflection, dynamic loading, or generated code
+
+**Project Structure:**
+- Multi-module projects discovered by directory walking only
+- No build system integration (Gradle, Maven, etc.)
+- Source sets must be in standard locations
+
+**Language Support:**
+- Primary: Kotlin (.kt, .kts) and Java (.java)
+- AST engine: Kotlin only
+- Regex engine: Basic Java support, extensible patterns
+
+**Member Usage Detection:**
+- Best-effort receiver type analysis  
+- May miss complex method chaining scenarios
+- Static/companion access detection limited
+
+### Known Edge Cases
+
+**Kotlin-specific:**
+- Context parameters (Kotlin 2.2+) may not parse correctly
+- Some DSL patterns may confuse member detection
+- Inline functions and reified generics have limited support
+
+**Java-specific:**
+- Complex generic syntax may be imprecise
+- Anonymous classes and lambdas have limited member tracking
+- Annotation processing results not detected
+
+**General:**
+- Very common class names (e.g., "User", "Item") may have noise
+- Dynamic proxy usage and reflection calls missed
+- Code generation from build plugins not detected
 
 ## Maintainer & Links
 
 - **Name**: Ehsan Kolivand
-- **Email**: [ehsankolivandeh@gmail.con](mailto:ehsankolivandeh@gmail.con)  
+- **Email**: [ehsankolivandeh@gmail.com](mailto:ehsankolivandeh@gmail.com)  
 - **LinkedIn**: [https://www.linkedin.com/in/ehsan-koolivand/](https://www.linkedin.com/in/ehsan-koolivand/)
 
-## License
 
-License: *unspecified*

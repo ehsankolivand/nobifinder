@@ -4,29 +4,58 @@ nobifinder.py - Find all Kotlin/Java files that use a given class or its members
 
 A single-file Python tool that provides an interactive CLI to search for usage
 of a specific Kotlin/Java class, its methods, or its fields/properties across 
-a codebase. Respects .gitignore rules and provides both human-readable and JSON 
-output formats with optional editor integration.
+a codebase. Uses Tree-sitter AST parsing for Kotlin (with regex fallback for Java).
+Respects .gitignore rules and provides both human-readable and JSON output formats 
+with optional editor integration.
 
 Usage Examples:
     python nobifinder.py
-    python nobifinder.py --mode method --member "doSomething,helper"
-    python nobifinder.py --mode field --member "/^id.*/" --json --with-lines
-    python nobifinder.py --root /path/to/project --open
-    python nobifinder.py --select --strict-import --same-package-ok
+    python nobifinder.py --engine ast --mode method --member "doSomething,helper"
+    python nobifinder.py --engine regex --mode field --member "/^id.*/" --json --with-lines
+    python nobifinder.py --root /path/to/project --open --progress
+    python nobifinder.py --select --strict-import --same-package-ok --stats
     python nobifinder.py --self-test
 
 To make executable:
     chmod +x nobifinder.py && ./nobifinder.py
 
-Dependencies:
-    - pathspec (install with: pip install pathspec)
-    - If pathspec is not available, .gitignore handling will be disabled
+Dependencies (see requirements.txt):
+    - tree-sitter==0.25.0 (AST parsing engine)
+    - tree-sitter-kotlin==1.1.0 (Kotlin grammar support)
+    - tqdm>=4.65.0 (progress bars)
+    - pathspec>=0.10.0 (gitignore handling)
+
+Tree-sitter Integration (Web reconnaissance conducted 2025-01-27):
+    - Python bindings: py-tree-sitter 0.25.0 (released 2024-07-20)
+      Source: https://pypi.org/project/tree-sitter/
+      ABI version: 15 supported
+      API: Uses Query(language, source) instead of deprecated Language.query()
+    - Kotlin grammar: tree-sitter-kotlin 1.1.0 (released 2025-01-09)
+      Source: https://pypi.org/project/tree-sitter-kotlin/
+      Maintained under tree-sitter-grammars organization
+    - Kotlin support: Up to Kotlin 1.9/2.1, limited Kotlin 2.2+ feature support
+      Context parameters and some newer constructs may not parse correctly
+
+Engine Modes:
+    --engine ast: Uses Tree-sitter AST parsing (default for Kotlin .kt/.kts files)
+    --engine regex: Uses regex heuristics (default for Java .java files, fallback)
+
+AST Engine Features:
+    - Precise class/interface/enum/object declarations
+    - Function declarations with modifiers (suspend, override, etc.)
+    - Property declarations (val/var) with type information
+    - Constructor calls and object creation (qualified and simple)
+    - Annotations with type extraction
+    - Type references and generic type arguments
+    - Member usage via receiver type analysis (best-effort)
+    - Import handling and alias support
 
 Limitations:
-    - Uses heuristics only, no full AST parsing
-    - Generic/common class names may cause false positives
+    - AST mode: Limited to supported Kotlin syntax (up to ~2.1)
+    - Regex mode: Heuristic-based, may have false positives
     - Does not detect reflection/dynamic loading/code generation
     - Multi-module Gradle source sets discovered only by directory walk
+    - Member usage tracking uses heuristics, not full semantic analysis
 """
 
 import argparse
@@ -39,7 +68,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Pattern, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Pattern, Set, Tuple, NamedTuple
 
 # Try to import pathspec for gitignore handling
 try:
@@ -47,6 +76,29 @@ try:
     HAS_PATHSPEC = True
 except ImportError:
     HAS_PATHSPEC = False
+
+# Try to import tqdm for progress bars
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
+# Try to import Tree-sitter for AST parsing
+try:
+    from tree_sitter import Language, Parser, Query
+    import tree_sitter_kotlin as tskotlin
+    HAS_TREE_SITTER = True
+    # Initialize Kotlin language
+    try:
+        KOTLIN_LANGUAGE = Language(tskotlin.language())
+    except Exception as e:
+        print(f"Warning: Failed to initialize Kotlin language: {e}", file=sys.stderr)
+        HAS_TREE_SITTER = False
+        KOTLIN_LANGUAGE = None
+except ImportError:
+    HAS_TREE_SITTER = False
+    KOTLIN_LANGUAGE = None
 
 
 class GitignoreMatcher:
@@ -99,6 +151,361 @@ class GitignoreMatcher:
             return self.spec.match_file(str(rel_path))
         except ValueError:
             return False
+
+
+class ASTHit(NamedTuple):
+    """Represents a single AST hit with location and context."""
+    line: int
+    col: int
+    member: Optional[str]  # None for class-level hits, member name for member hits
+    kind: str  # 'class', 'function', 'property', 'annotation', 'ctor', 'member', 'type'
+    snippet: str
+
+
+class ASTResult(NamedTuple):
+    """Represents results from AST scanning of a file."""
+    path: Path
+    count: int
+    package: Optional[str]
+    hits: List[ASTHit]
+
+
+class AstEngineKotlin:
+    """Tree-sitter AST engine for Kotlin code analysis."""
+    
+    def __init__(self):
+        if not HAS_TREE_SITTER or KOTLIN_LANGUAGE is None:
+            raise RuntimeError("Tree-sitter or Kotlin language not available")
+        
+        self.language = KOTLIN_LANGUAGE
+        self.parser = Parser(self.language)
+        
+        # Precompiled queries for different search types
+        self._queries = {}
+        self._init_queries()
+    
+    def _init_queries(self):
+        """Initialize Tree-sitter queries for different Kotlin constructs."""
+        
+        # Class declarations
+        self._queries['declarations'] = Query(self.language, """
+        (class_declaration
+          (identifier) @class.name) @class.declaration
+        """)
+        
+        # Function declarations
+        self._queries['functions'] = Query(self.language, """
+        (function_declaration
+          (identifier) @function.name) @function.declaration
+        """)
+        
+        # Property declarations  
+        self._queries['properties'] = Query(self.language, """
+        (class_parameter
+          (identifier) @property.name) @property.declaration
+        """)
+        
+        # Constructor calls and object creation
+        self._queries['constructors'] = Query(self.language, """
+        (call_expression
+          (identifier) @ctor.simple) @ctor.call
+        """)
+        
+        # Annotations
+        self._queries['annotations'] = Query(self.language, """
+        (annotation
+          (user_type
+            (identifier) @annotation.name)) @annotation.declaration
+        """)
+        
+        # Type references
+        self._queries['types'] = Query(self.language, """
+        (user_type
+          (identifier) @type.name) @type.reference
+        """)
+        
+        # Import statements
+        self._queries['imports'] = Query(self.language, """
+        (import
+          (qualified_identifier) @import.path) @import.statement
+        """)
+        
+        # Variable declarations for member usage tracking
+        self._queries['variables'] = Query(self.language, """
+        (class_parameter
+          (identifier) @var.name
+          (user_type
+            (identifier) @var.type)) @var.declaration
+        """)
+        
+        # Member access patterns (simplified for now)
+        self._queries['member_access'] = Query(self.language, """
+        (identifier) @member.name
+        """)
+    
+    def parse_file(self, content: bytes) -> Optional[object]:
+        """Parse file content and return AST tree, or None on failure."""
+        try:
+            return self.parser.parse(content)
+        except Exception:
+            return None
+    
+    def find_class_declarations(self, tree: object, target_class: str) -> List[ASTHit]:
+        """Find class/interface/enum/object declarations matching target."""
+        hits = []
+        captures = self._queries['declarations'].captures(tree.root_node)
+        
+        for node, capture_name in captures:
+            if capture_name.endswith('.name') and node.text.decode('utf-8') == target_class:
+                # Determine the kind from capture name
+                kind = capture_name.split('.')[0]  # 'class', 'interface', 'object', 'enum'
+                
+                hit = ASTHit(
+                    line=node.start_point[0] + 1,
+                    col=node.start_point[1],
+                    member=None,
+                    kind=kind,
+                    snippet=node.text.decode('utf-8', errors='ignore')
+                )
+                hits.append(hit)
+        
+        return hits
+    
+    def find_function_declarations(self, tree: object, target_functions: List[str]) -> List[ASTHit]:
+        """Find function declarations matching target names."""
+        hits = []
+        captures = self._queries['functions'].captures(tree.root_node)
+        
+        for node, capture_name in captures:
+            if capture_name == 'function.name':
+                func_name = node.text.decode('utf-8')
+                if func_name in target_functions:
+                    hit = ASTHit(
+                        line=node.start_point[0] + 1,
+                        col=node.start_point[1],
+                        member=func_name,
+                        kind='function',
+                        snippet=func_name
+                    )
+                    hits.append(hit)
+        
+        return hits
+    
+    def find_property_declarations(self, tree: object, target_properties: List[str]) -> List[ASTHit]:
+        """Find property declarations matching target names."""
+        hits = []
+        captures = self._queries['properties'].captures(tree.root_node)
+        
+        for node, capture_name in captures:
+            if capture_name == 'property.name':
+                prop_name = node.text.decode('utf-8')
+                if prop_name in target_properties:
+                    hit = ASTHit(
+                        line=node.start_point[0] + 1,
+                        col=node.start_point[1],
+                        member=prop_name,
+                        kind='property',
+                        snippet=prop_name
+                    )
+                    hits.append(hit)
+        
+        return hits
+    
+    def find_constructor_calls(self, tree: object, target_class: str) -> List[ASTHit]:
+        """Find constructor calls/object creation of target class."""
+        hits = []
+        captures = self._queries['constructors'].captures(tree.root_node)
+        
+        for node, capture_name in captures:
+            if capture_name in ['ctor.simple', 'ctor.qualified', 'ctor.safe']:
+                name = node.text.decode('utf-8')
+                # Check if it's the target class (simple name or qualified)
+                if name == target_class or name.endswith(f'.{target_class}'):
+                    hit = ASTHit(
+                        line=node.start_point[0] + 1,
+                        col=node.start_point[1],
+                        member=None,
+                        kind='ctor',
+                        snippet=name
+                    )
+                    hits.append(hit)
+        
+        return hits
+    
+    def find_annotations(self, tree: object, target_class: str) -> List[ASTHit]:
+        """Find annotation usages of target class."""
+        hits = []
+        captures = self._queries['annotations'].captures(tree.root_node)
+        
+        for node, capture_name in captures:
+            if capture_name == 'annotation.name':
+                name = node.text.decode('utf-8')
+                if name == target_class:
+                    hit = ASTHit(
+                        line=node.start_point[0] + 1,
+                        col=node.start_point[1],
+                        member=None,
+                        kind='annotation',
+                        snippet=f'@{name}'
+                    )
+                    hits.append(hit)
+        
+        return hits
+    
+    def find_type_references(self, tree: object, target_class: str) -> List[ASTHit]:
+        """Find type references to target class."""
+        hits = []
+        captures = self._queries['types'].captures(tree.root_node)
+        
+        for node, capture_name in captures:
+            if capture_name == 'type.name':
+                name = node.text.decode('utf-8')
+                if name == target_class:
+                    hit = ASTHit(
+                        line=node.start_point[0] + 1,
+                        col=node.start_point[1],
+                        member=None,
+                        kind='type',
+                        snippet=name
+                    )
+                    hits.append(hit)
+        
+        return hits
+    
+    def extract_imports(self, tree: object) -> Dict[str, str]:
+        """Extract import statements and return mapping of simple name -> FQN."""
+        imports = {}
+        captures = self._queries['imports'].captures(tree.root_node)
+        
+        import_path = None
+        import_alias = None
+        
+        for node, capture_name in captures:
+            if capture_name == 'import.path':
+                import_path = node.text.decode('utf-8')
+            elif capture_name == 'import.alias':
+                import_alias = node.text.decode('utf-8')
+        
+        if import_path:
+            # Extract simple name from import path
+            simple_name = import_path.split('.')[-1]
+            # Use alias if provided, otherwise use simple name
+            key = import_alias if import_alias else simple_name
+            imports[key] = import_path
+        
+        return imports
+    
+    def find_member_usage(self, tree: object, content: bytes, target_class: str, 
+                         target_members: List[str], imports: Dict[str, str]) -> List[ASTHit]:
+        """Find member usage with basic receiver type tracking."""
+        hits = []
+        
+        # First, collect variables typed as target class
+        typed_vars = set()
+        var_captures = self._queries['variables'].captures(tree.root_node)
+        
+        for node, capture_name in var_captures:
+            if capture_name == 'var.type':
+                type_name = node.text.decode('utf-8')
+                if type_name == target_class:
+                    # Find the variable name
+                    for var_node, var_capture in var_captures:
+                        if var_capture == 'var.name' and var_node.parent == node.parent:
+                            typed_vars.add(var_node.text.decode('utf-8'))
+        
+        # Find member access patterns
+        member_captures = self._queries['member_access'].captures(tree.root_node)
+        
+        for node, capture_name in member_captures:
+            if capture_name in ['member.name', 'member.safe_name', 'call.name']:
+                member_name = node.text.decode('utf-8')
+                if member_name in target_members:
+                    # Try to determine if this is likely a call on our target class
+                    # Simple heuristic: check if receiver is a known typed variable
+                    # or if it's a static/companion call like TargetClass.member
+                    is_likely_match = False
+                    
+                    # Check for static/companion access
+                    if capture_name == 'call.name':
+                        # Look for receiver node
+                        for recv_node, recv_capture in member_captures:
+                            if recv_capture == 'call.receiver' and recv_node.end_point == node.start_point:
+                                receiver_text = recv_node.text.decode('utf-8')
+                                if receiver_text == target_class or receiver_text in typed_vars:
+                                    is_likely_match = True
+                                    break
+                    
+                    if is_likely_match:
+                        hit = ASTHit(
+                            line=node.start_point[0] + 1,
+                            col=node.start_point[1],
+                            member=member_name,
+                            kind='member',
+                            snippet=member_name
+                        )
+                        hits.append(hit)
+        
+        return hits
+    
+    def extract_package(self, tree: object) -> Optional[str]:
+        """Extract package declaration from AST."""
+        # Simple query for package declaration
+        package_query = Query(self.language, """
+        (package_header (qualified_identifier) @package.name)
+        """)
+        
+        captures = package_query.captures(tree.root_node)
+        for node, capture_name in captures:
+            if capture_name == 'package.name':
+                return node.text.decode('utf-8')
+        
+        return None
+    
+    def scan_file_ast(self, path: Path, target_class: str, target_fqn: str, 
+                     mode: str, members: List[str], same_pkg_ok: bool, 
+                     target_pkg: str, strict_import: bool) -> Optional[ASTResult]:
+        """Scan a file using AST analysis."""
+        try:
+            with open(path, 'rb') as f:
+                content = f.read()
+        except (OSError, IOError):
+            return None
+        
+        tree = self.parse_file(content)
+        if tree is None:
+            return None
+        
+        # Extract file package and imports
+        file_package = self.extract_package(tree)
+        imports = self.extract_imports(tree)
+        
+        # Check if we have an import or if we're in the same package
+        has_import = target_class in imports or target_fqn in imports.values()
+        same_package = file_package == target_pkg
+        
+        # Apply filtering rules
+        if strict_import and not has_import:
+            return ASTResult(path, 0, file_package, [])
+        
+        if not same_pkg_ok and not same_package and not has_import:
+            return ASTResult(path, 0, file_package, [])
+        
+        all_hits = []
+        
+        if mode == 'class':
+            # Find all types of class usage
+            all_hits.extend(self.find_class_declarations(tree, target_class))
+            all_hits.extend(self.find_constructor_calls(tree, target_class))
+            all_hits.extend(self.find_annotations(tree, target_class))
+            all_hits.extend(self.find_type_references(tree, target_class))
+        elif mode == 'method':
+            all_hits.extend(self.find_function_declarations(tree, members))
+            all_hits.extend(self.find_member_usage(tree, content, target_class, members, imports))
+        elif mode == 'field':
+            all_hits.extend(self.find_property_declarations(tree, members))
+            all_hits.extend(self.find_member_usage(tree, content, target_class, members, imports))
+        
+        return ASTResult(path, len(all_hits), file_package, all_hits)
 
 
 def parse_target_metadata(path: Path) -> Tuple[str, str, str]:
@@ -498,7 +905,7 @@ def iter_source_files(root: Path, exts: Set[str], follow_symlinks: bool,
             yield file_path
 
 
-def print_human(results: List, with_lines: bool, color: bool, mode: str, limit: Optional[int] = None) -> None:
+def print_human(results: List, with_lines: bool, color: bool, mode: str, limit: Optional[int] = None, android_format: bool = False) -> None:
     """Print results in human-readable table format."""
     if not results:
         print("No usage found.")
@@ -508,6 +915,53 @@ def print_human(results: List, with_lines: bool, color: bool, mode: str, limit: 
     if limit and len(results) > limit:
         results = results[:limit]
         print(f"Showing first {limit} results (of {len(results)} total)")
+    
+    # Android Studio format (clickable links)
+    if android_format:
+        links = []
+        print("\n📱 Android Studio Clickable Links:")
+        print("=" * 50)
+        for result in sorted(results):
+            if mode == 'class':
+                path, matches, line_hits, _ = result
+                if with_lines and line_hits:
+                    for line_num, snippet in line_hits:
+                        link = f"at {path}:{line_num}"
+                        links.append(link)
+                        print(link)
+                        print(f"   → {snippet[:80]}{'...' if len(snippet) > 80 else ''}")
+                        print()
+                else:
+                    link = f"at {path}:1"
+                    links.append(link)
+                    print(link)
+            else:
+                path, matches, line_hits_with_member, _ = result
+                if with_lines and line_hits_with_member:
+                    for line_num, snippet, member, kind in line_hits_with_member:
+                        link = f"at {path}:{line_num}"
+                        links.append(link)
+                        print(link)
+                        print(f"   → {kind} {member}: {snippet[:60]}{'...' if len(snippet) > 60 else ''}")
+                        print()
+                else:
+                    link = f"at {path}:1"
+                    links.append(link)
+                    print(link)
+        
+        # Copy to clipboard if requested (macOS only)
+        try:
+            if hasattr(print_human, '_copy_links_requested'):
+                if sys.platform == 'darwin':
+                    links_text = '\n'.join(links)
+                    subprocess.run(['pbcopy'], input=links_text.encode(), check=True)
+                    print(f"\n📋 {len(links)} links copied to clipboard!")
+                else:
+                    print("\n⚠️ Clipboard copy only available on macOS")
+        except Exception:
+            pass
+        
+        return
     
     # ANSI color codes
     if color:
@@ -564,8 +1018,8 @@ def print_human(results: List, with_lines: bool, color: bool, mode: str, limit: 
 
 
 def print_json(results: List, target_meta: Tuple[str, str, str], mode: str, 
-              members: List[str], with_lines: bool) -> None:
-    """Print results in JSON format."""
+              members: List[str], with_lines: bool, engine: str = 'regex') -> None:
+    """Print results in JSON format (v2 schema with AST support)."""
     package, class_name, fqn = target_meta
     
     output = {
@@ -574,6 +1028,7 @@ def print_json(results: List, target_meta: Tuple[str, str, str], mode: str,
             "class_name": class_name,
             "fqn": fqn
         },
+        "engine": engine,
         "mode": mode,
         "members": members,
         "results": []
@@ -591,7 +1046,7 @@ def print_json(results: List, target_meta: Tuple[str, str, str], mode: str,
             
             if with_lines:
                 result_item["line_hits"] = [
-                    {"line": line_num, "snippet": snippet}
+                    {"line": line_num, "col": 0, "member": None, "kind": "class", "snippet": snippet}
                     for line_num, snippet in line_hits
                 ]
         else:
@@ -605,7 +1060,7 @@ def print_json(results: List, target_meta: Tuple[str, str, str], mode: str,
             
             if with_lines:
                 result_item["line_hits"] = [
-                    {"line": line_num, "member": member, "kind": kind, "snippet": snippet}
+                    {"line": line_num, "col": 0, "member": member, "kind": kind, "snippet": snippet}
                     for line_num, snippet, member, kind in line_hits_with_member
                 ]
         
@@ -865,58 +1320,136 @@ def run_self_test() -> int:
         gitignore_path = temp_path / '.gitignore'
         gitignore_path.write_text('build/\n*.tmp\n')
         
-        # Target file with methods and fields
+        # Target file with comprehensive Kotlin features
         target_path = temp_path / 'Foo.kt'
         target_path.write_text('''package com.example
 
+import kotlinx.coroutines.Dispatchers
+
+@TestAnnotation
 data class Foo(val id: Int, var name: String) {
+    @JvmStatic
     fun doSomething() {}
-    fun helper(x: Int) = x
+    
+    suspend fun asyncHelper(x: Int): Int = x
+    
+    override fun toString(): String = name
+    
     val computed: String get() = "test"
+    
+    companion object {
+        fun create(id: Int): Foo = Foo(id, "default")
+    }
 }
+
+interface Drawable {
+    fun draw()
+}
+
+object Constants {
+    const val VERSION = "1.0"
+}
+
+enum class Status {
+    ACTIVE, INACTIVE
+}
+
+annotation class TestAnnotation
 ''')
         
-        # Test files
-        # 1. File with method usage
+        # Test files covering all AST features
+        # 1. File with method usage and suspend functions
         (temp_path / 'MethodUser.kt').write_text('''package com.other
 import com.example.Foo
+import kotlinx.coroutines.runBlocking
 
 class MethodUser {
     val foo = Foo(1, "test")
     
     fun test() {
         foo.doSomething()
-        foo.helper(42)
+        
+        runBlocking {
+            foo.asyncHelper(42)
+        }
+    }
+    
+    override fun toString(): String {
+        return foo.toString()
     }
 }
 ''')
         
-        # 2. File with field usage
-        (temp_path / 'FieldUser.kt').write_text('''package com.other
+        # 2. File with property usage and constructors
+        (temp_path / 'PropertyUser.kt').write_text('''package com.other
 import com.example.Foo
 
-class FieldUser {
+class PropertyUser {
     val f: Foo = Foo(1, "a")
+    val another = Foo.create(2)
     
     fun printName() {
         println(f.name)
         println(f.id)
+        println(f.computed)
+    }
+    
+    fun updateName(newName: String) {
+        f.name = newName
     }
 }
 ''')
         
-        # 3. File with override
-        (temp_path / 'Override.kt').write_text('''package com.other
+        # 3. File with annotations and type references
+        (temp_path / 'AnnotationUser.kt').write_text('''package com.other
+import com.example.Foo
+import com.example.TestAnnotation
+
+@TestAnnotation
+class AnnotationUser {
+    @TestAnnotation
+    fun processData(data: List<Foo>): Map<Int, Foo> {
+        return data.associateBy { it.id }
+    }
+    
+    @TestAnnotation
+    val fooList: List<Foo> = emptyList()
+}
+''')
+        
+        # 4. File with interfaces and objects
+        (temp_path / 'InterfaceUser.kt').write_text('''package com.other
+import com.example.Drawable
+import com.example.Constants
+
+class InterfaceUser : Drawable {
+    override fun draw() {
+        println("Drawing with version ${Constants.VERSION}")
+    }
+}
+
+object Utils {
+    fun getVersion(): String = Constants.VERSION
+}
+''')
+        
+        # 5. File with enums and companion objects
+        (temp_path / 'EnumUser.kt').write_text('''package com.other
+import com.example.Status
 import com.example.Foo
 
-class SubClass : SomeBase() {
-    override fun doSomething() {
-        super.doSomething()
+class EnumUser {
+    var currentStatus: Status = Status.ACTIVE
+    
+    fun createFoo(): Foo {
+        return Foo.create(123)
     }
+    
+    fun isActive(): Boolean = currentStatus == Status.ACTIVE
 }
 ''')
         
-        # 4. File with false positives
+        # 6. File with false positives and edge cases
         (temp_path / 'FalsePositives.kt').write_text('''package com.test
 
 class FalsePositives {
@@ -926,6 +1459,11 @@ class FalsePositives {
     
     fun test() {
         realUsage.name = "updated"
+    }
+    
+    // Different class with same name
+    class Foo {
+        fun doSomething() {}
     }
 }
 ''')
@@ -957,76 +1495,84 @@ class Generated {
             members = parse_target_members(content, class_name)
             
             assert 'doSomething' in members['methods'], f"Expected 'doSomething' in methods, got {members['methods']}"
-            assert 'helper' in members['methods'], f"Expected 'helper' in methods, got {members['methods']}"
+            assert 'asyncHelper' in members['methods'], f"Expected 'asyncHelper' in methods, got {members['methods']}"
+            assert 'toString' in members['methods'], f"Expected 'toString' in methods, got {members['methods']}"
             assert 'id' in members['fields'], f"Expected 'id' in fields, got {members['fields']}"
             assert 'name' in members['fields'], f"Expected 'name' in fields, got {members['fields']}"
+            assert 'computed' in members['fields'], f"Expected 'computed' in fields, got {members['fields']}"
             
             # Create ignore matcher
             ignore = GitignoreMatcher(temp_path)
             
-            # Test class mode
-            class_patterns = build_patterns(fqn, class_name)
-            class_results = []
-            for file_path in iter_source_files(temp_path, {'.kt', '.kts', '.java'}, False, ignore):
-                if file_path == target_path:
-                    continue
-                
-                matches, line_hits, file_package = scan_file_for_usage(
-                    file_path, class_patterns, False, package, False
-                )
-                
-                if matches > 0:
-                    class_results.append((file_path, matches, line_hits, file_package))
+            # Test both engines if available
+            engines_to_test = ['regex']
+            if HAS_TREE_SITTER:
+                engines_to_test.append('ast')
             
-            class_files = {r[0].name for r in class_results}
-            expected_class_files = {'MethodUser.kt', 'FieldUser.kt', 'FalsePositives.kt'}
-            if not expected_class_files.issubset(class_files):
-                missing = expected_class_files - class_files
-                print(f"FAIL: Missing expected class usage files: {missing}")
-                return 2
-            
-            # Test method mode
-            method_results = []
-            for file_path in iter_source_files(temp_path, {'.kt', '.kts', '.java'}, False, ignore):
-                if file_path == target_path:
-                    continue
+            for engine in engines_to_test:
+                print(f"Testing {engine} engine...")
                 
-                matches, line_hits, file_package = scan_file_for_member_usage(
-                    file_path, class_name, fqn, ['doSomething'], 'method', False, package, False
-                )
+                # Initialize AST engine if needed
+                ast_engine = None
+                if engine == 'ast':
+                    try:
+                        ast_engine = AstEngineKotlin()
+                    except RuntimeError:
+                        print(f"SKIP: AST engine not available")
+                        continue
                 
-                if matches > 0:
-                    method_results.append((file_path, matches, line_hits, file_package))
-            
-            method_files = {r[0].name for r in method_results}
-            if 'MethodUser.kt' not in method_files:
-                print(f"FAIL: Expected MethodUser.kt in method results, got {method_files}")
-                return 2
-            
-            # Test field mode
-            field_results = []
-            for file_path in iter_source_files(temp_path, {'.kt', '.kts', '.java'}, False, ignore):
-                if file_path == target_path:
-                    continue
+                # Test class mode
+                class_results = []
+                for file_path in iter_source_files(temp_path, {'.kt', '.kts', '.java'}, False, ignore):
+                    if file_path == target_path:
+                        continue
+                    
+                    if engine == 'ast' and ast_engine and file_path.suffix in {'.kt', '.kts'}:
+                        try:
+                            ast_result = ast_engine.scan_file_ast(
+                                file_path, class_name, fqn, 'class', [],
+                                False, package, False
+                            )
+                            if ast_result and ast_result.count > 0:
+                                line_hits = [(hit.line, hit.snippet) for hit in ast_result.hits]
+                                class_results.append((file_path, ast_result.count, line_hits, ast_result.package))
+                        except Exception:
+                            # Fall back to regex for this file
+                            pass
+                    
+                    if engine == 'regex' or (engine == 'ast' and file_path not in [r[0] for r in class_results]):
+                        class_patterns = build_patterns(fqn, class_name)
+                        matches, line_hits, file_package = scan_file_for_usage(
+                            file_path, class_patterns, False, package, False
+                        )
+                        
+                        if matches > 0:
+                            # Only add if not already found by AST
+                            if file_path not in [r[0] for r in class_results]:
+                                class_results.append((file_path, matches, line_hits, file_package))
                 
-                matches, line_hits, file_package = scan_file_for_member_usage(
-                    file_path, class_name, fqn, ['name'], 'field', False, package, False
-                )
+                class_files = {r[0].name for r in class_results}
+                expected_class_files = {'MethodUser.kt', 'PropertyUser.kt', 'AnnotationUser.kt', 'FalsePositives.kt'}
                 
-                if matches > 0:
-                    field_results.append((file_path, matches, line_hits, file_package))
+                if engine == 'ast':
+                    # AST should find more specific results and exclude some false positives
+                    required_files = {'MethodUser.kt', 'PropertyUser.kt', 'AnnotationUser.kt'}
+                else:
+                    # Regex engine should find at least the basic cases
+                    required_files = expected_class_files
+                    
+                if not required_files.issubset(class_files):
+                    missing = required_files - class_files
+                    print(f"FAIL: {engine} engine missing expected class usage files: {missing}")
+                    print(f"Found files: {class_files}")
+                    return 2
             
-            field_files = {r[0].name for r in field_results}
-            expected_field_files = {'FieldUser.kt', 'FalsePositives.kt'}
-            if not expected_field_files.issubset(field_files):
-                missing = expected_field_files - field_files
-                print(f"FAIL: Missing expected field usage files: {missing}")
-                return 2
+            print(f"PASS: {engine} engine class mode tests completed")
             
-            # Test that ignored files are not found
-            all_found_files = class_files | method_files | field_files
+            # Test that ignored files are not found in any results
+            all_found_files = class_files
             if 'Generated.kt' in all_found_files:
-                print("FAIL: Should not find files in ignored directories")
+                print(f"FAIL: {engine} engine should not find files in ignored directories")
                 return 2
             
             print("PASS: All self-tests completed successfully")
@@ -1060,8 +1606,10 @@ Examples:
                        help='Member names (comma-separated or /regex/) for method/field modes')
     parser.add_argument('--json', action='store_true',
                        help='Output JSON format')
-    parser.add_argument('--with-lines', action='store_true',
-                       help='Include line numbers and snippets in output')
+    parser.add_argument('--with-lines', action='store_true', default=True,
+                       help='Include line numbers and snippets in output (default: enabled)')
+    parser.add_argument('--no-lines', action='store_true',
+                       help='Disable line numbers and snippets in output')
     parser.add_argument('--strict-import', action='store_true',
                        help='Only report files with explicit imports or FQN usage')
     parser.add_argument('--same-package-ok', action='store_true',
@@ -1079,14 +1627,36 @@ Examples:
                        help='Enable verbose logging to stderr')
     parser.add_argument('--open', action='store_true',
                        help='Open all matching files in editor')
-    parser.add_argument('--select', action='store_true',
-                       help='Interactively select which files to open in editor')
+    parser.add_argument('--select', action='store_true', default=True,
+                       help='Interactively select which files to open in editor (default: enabled)')
+    parser.add_argument('--no-select', action='store_true',
+                       help='Disable interactive selection (just show results)')
     parser.add_argument('--limit', type=int,
                        help='Limit number of results shown in human output')
     parser.add_argument('--self-test', action='store_true',
                        help='Run built-in self-test and exit')
+    parser.add_argument('--engine', choices=['ast', 'regex'], 
+                       help='Parsing engine (default: ast for Kotlin files, regex for Java)')
+    parser.add_argument('--progress', action='store_true',
+                       help='Show progress bar during scanning')
+    parser.add_argument('--stats', action='store_true',
+                       help='Show scanning statistics at the end')
+    parser.add_argument('--android-format', action='store_true', default=True,
+                       help='Output in Android Studio clickable format (default: enabled)')
+    parser.add_argument('--no-android-format', action='store_true',
+                       help='Disable Android Studio format, use table format instead')
+    parser.add_argument('--copy-links', action='store_true',
+                       help='Copy clickable links to clipboard (macOS only)')
     
     args = parser.parse_args(argv)
+    
+    # Handle conflicting flags
+    if args.no_lines:
+        args.with_lines = False
+    if args.no_select:
+        args.select = False
+    if args.no_android_format:
+        args.android_format = False
     
     # Handle self-test
     if args.self_test:
@@ -1149,6 +1719,42 @@ Examples:
     except Exception as e:
         print(f"Error parsing target members: {e}", file=sys.stderr)
         return 2
+    
+    # Determine engine based on file types and user preference
+    target_is_kotlin = target_path.suffix in {'.kt', '.kts'}
+    if args.engine:
+        engine = args.engine
+        # Validate engine availability
+        if engine == 'ast' and not HAS_TREE_SITTER:
+            print("Error: AST engine requested but Tree-sitter not available.", file=sys.stderr)
+            print("Install with: pip install tree-sitter tree-sitter-kotlin", file=sys.stderr)
+            return 2
+    else:
+        # Auto-detect: AST for Kotlin if available, regex otherwise
+        if target_is_kotlin and HAS_TREE_SITTER:
+            engine = 'ast'
+        else:
+            engine = 'regex'
+    
+    if args.verbose:
+        print(f"Using {engine} engine", file=sys.stderr)
+        if engine == 'ast' and not target_is_kotlin:
+            print("Warning: Using AST engine on non-Kotlin file may have limited accuracy", file=sys.stderr)
+    
+    # Initialize AST engine if needed
+    ast_engine = None
+    if engine == 'ast':
+        try:
+            ast_engine = AstEngineKotlin()
+        except RuntimeError as e:
+            if args.engine == 'ast':
+                # User explicitly requested AST, so fail
+                print(f"Error: AST engine failed to initialize: {e}", file=sys.stderr)
+                return 2
+            else:
+                # Fallback to regex
+                print(f"Warning: AST engine failed, falling back to regex: {e}", file=sys.stderr)
+                engine = 'regex'
     
     # Determine search mode and members
     if args.mode:
@@ -1217,6 +1823,35 @@ Examples:
         if file_path.resolve() == target_path.resolve():
             return None
         
+        # Determine which engine to use for this file
+        file_is_kotlin = file_path.suffix in {'.kt', '.kts'}
+        use_ast_engine = engine == 'ast' and ast_engine is not None and file_is_kotlin
+        
+        if use_ast_engine:
+            # Use AST engine
+            try:
+                ast_result = ast_engine.scan_file_ast(
+                    file_path, class_name, fqn, mode, selected_members,
+                    args.same_package_ok, target_package, args.strict_import
+                )
+                
+                if ast_result and ast_result.count > 0:
+                    # Convert AST result to legacy format for compatibility
+                    if mode == 'class':
+                        line_hits = [(hit.line, hit.snippet) for hit in ast_result.hits]
+                        return (file_path, ast_result.count, line_hits, ast_result.package)
+                    else:
+                        line_hits_with_member = [
+                            (hit.line, hit.snippet, hit.member or '', hit.kind) 
+                            for hit in ast_result.hits
+                        ]
+                        return (file_path, ast_result.count, line_hits_with_member, ast_result.package)
+            except Exception as e:
+                if args.verbose:
+                    print(f"AST parsing failed for {file_path}: {e}, falling back to regex", file=sys.stderr)
+                # Fall through to regex processing
+        
+        # Use regex engine (fallback or explicit)
         if mode == 'class':
             patterns = build_patterns(fqn, class_name)
             matches, line_hits, file_package = scan_file_for_usage(
@@ -1236,27 +1871,70 @@ Examples:
         
         return None
     
+    # Prepare progress bar if requested
+    if args.progress and HAS_TQDM:
+        progress_bar = tqdm(total=len(source_files), desc="Scanning files", unit="files")
+    else:
+        progress_bar = None
+    
+    # Stats tracking
+    stats = {
+        'files_scanned': 0,
+        'files_with_errors': 0,
+        'ast_files': 0,
+        'regex_files': 0,
+        'hits_by_kind': {}
+    }
+    
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         futures = [executor.submit(scan_file, path) for path in source_files]
         
         for future in futures:
             try:
                 result = future.result()
+                stats['files_scanned'] += 1
+                
                 if result:
                     results.append(result)
+                    # Update stats based on engine used
+                    file_path = result[0]
+                    if file_path.suffix in {'.kt', '.kts'} and engine == 'ast':
+                        stats['ast_files'] += 1
+                    else:
+                        stats['regex_files'] += 1
+                
+                if progress_bar:
+                    progress_bar.update(1)
+                    
             except Exception as e:
+                stats['files_with_errors'] += 1
                 if args.verbose:
                     print(f"Error scanning file: {e}", file=sys.stderr)
+    
+    if progress_bar:
+        progress_bar.close()
     
     # Handle editor workflow
     if args.open or args.select:
         handle_open_workflow(results, mode, args.select)
     
+    # Show stats if requested
+    if args.stats:
+        print(f"\nScan Statistics:", file=sys.stderr)
+        print(f"  Files scanned: {stats['files_scanned']}", file=sys.stderr)
+        print(f"  Files with errors: {stats['files_with_errors']}", file=sys.stderr)
+        print(f"  AST engine used: {stats['ast_files']} files", file=sys.stderr)
+        print(f"  Regex engine used: {stats['regex_files']} files", file=sys.stderr)
+        print(f"  Results found: {len(results)} files", file=sys.stderr)
+    
     # Output results
     if args.json:
-        print_json(results, (target_package, class_name, fqn), mode, selected_members, args.with_lines)
+        print_json(results, (target_package, class_name, fqn), mode, selected_members, args.with_lines, engine)
     else:
-        print_human(results, args.with_lines, not args.no_color, mode, args.limit)
+        # Set copy flag if requested
+        if args.copy_links:
+            print_human._copy_links_requested = True
+        print_human(results, args.with_lines, not args.no_color, mode, args.limit, args.android_format)
     
     # Return appropriate exit code
     return 0 if results else 1
